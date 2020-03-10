@@ -249,6 +249,22 @@ void Particles::DrawGUI(ID3D12GraphicsCommandList* in_pCommandList)
             (int)m_adapterDescriptionPtrs.size());
     }
 
+    if (m_renderAdapterIndex == m_computeAdapterIndex)
+    {
+        ImGui::Text("PERFORMANCE ISSUE: Not Multi-adapter");
+    }
+    else
+    {
+        if (m_pCompute->GetIsUMA())
+        {
+            ImGui::Text("Good: Compute is UMA");
+        }
+        else
+        {
+            ImGui::Text("PERFORMANCE ISSUE: Compute is not UMA");
+        }
+    }
+
     ImGui::Checkbox("Intel Q Extension", &m_commandQueueExtensionEnabled);
     ImGui::Checkbox("VSync", &m_vsyncEnabled);
     ImGui::Checkbox("FullScreen", &m_fullScreen);
