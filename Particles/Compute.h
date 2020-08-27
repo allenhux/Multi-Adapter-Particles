@@ -26,22 +26,29 @@
 #pragma once
 
 #include "AdapterShared.h"
+#include <DirectXMath.h>
+
+class ExtensionHelper;
 
 class Compute : public AdapterShared
 {
 public:
     Compute(UINT in_numParticles,
-        Microsoft::WRL::ComPtr<IDXGIAdapter1> in_adapter,
+        IDXGIAdapter1* in_pAdapter,
         bool in_useIntelCommandQueueExtension,
         Compute* in_pCompute = 0);
+    virtual ~Compute();
 
-    ~Compute();
+    Compute(const Compute&) = delete;
+    Compute(Compute&&) = delete;
+    Compute& operator=(const Compute&) = delete;
+    Compute& operator=(Compute&&) = delete;
 
     // input is fence value of other adapter. waits to overwrite shared buffer.
     void Simulate(int in_numActiveParticles, UINT64 in_sharedFenceValue);
 
     // changes extension setting only if different from current setting
-    void SetUseIntelCommandQueueExtension(bool in_desiredSetting) override;
+    void SetUseIntelCommandQueueExtension(bool in_desiredSetting);
 
     // provide cross-adapter shared handles to copy particle buffers to
     struct SharedHandles
@@ -52,7 +59,7 @@ public:
         UINT64 m_alignedDataSize;
         UINT m_bufferIndex;
     };
-    SharedHandles GetSharedHandles(HANDLE in_fenceHandle);
+    const SharedHandles& GetSharedHandles(HANDLE in_fenceHandle);
 
     UINT64 GetFenceValue() const { return m_fenceValue; }
 
@@ -62,16 +69,21 @@ public:
     };
 
     // stalls until adapter is idle
-    void WaitForGpu();
+    virtual void WaitForGpu() override;
+
+    void SetAsync(
+        ComPtr<ID3D12Fence> in_fence,
+        ComPtr<ID3D12Resource>* in_buffers,
+        UINT in_bufferIndex);
+    void ResetFromAsyncHelper();
 private:
     static constexpr UINT m_NUM_BUFFERS = 2;
 
-    static const float ParticleSpread;
+    static constexpr float ParticleSpread = PARTICLE_SPREAD;
     const UINT m_numParticles;
 
-    class ExtensionHelper* m_pExtensionHelper;
+    ExtensionHelper* m_pExtensionHelper;
 
-    ComPtr<IDXGIAdapter1> m_adapter;
     ComPtr<ID3D12Device> m_device;
 
     // compute command queue
@@ -96,8 +108,7 @@ private:
     ComPtr<ID3D12Resource> m_positionBuffers[m_NUM_BUFFERS];
     SharedHandles m_sharedHandles;
 
-    void Initialize(ComPtr<IDXGIAdapter1>);
-    void SetAdapter(ComPtr<IDXGIAdapter1>);
+    void Initialize(IDXGIAdapter1* in_pAdapter);
     void CreateCommandQueue();
     void CreateSharedBuffers();
 
@@ -111,7 +122,10 @@ private:
     // sample code waited in this method
     // this version returns a handle, so the calling function can WaitOn/Multiple/
     void MoveToNextFrame();
-    ComPtr<ID3D12Fence> m_sharedFence;
+    ComPtr<ID3D12Fence> m_sharedRenderFence;
 
     void CopyState(Compute* in_pCompute);
+
+    // shenanigans to simplify transitioning /out/ of async compute mode
+    ComPtr<ID3D12Resource> m_sharedComputeBuffersReference[m_NUM_BUFFERS];
 };

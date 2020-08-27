@@ -24,118 +24,111 @@
 //
 //*********************************************************
 
-#include <d3d12.h>
-#include <Windows.h>
+#include <cassert>
 #include <algorithm> // for std::min()
 
-#include "Particles.h"
-#include "d3dx12.h"
+#include <d3d12.h>
+#include <dxgidebug.h>
+#include <shellapi.h> // for CommandLineToArgvW
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx12.h"
 
-using Microsoft::WRL::ComPtr;
-
-const INT ParticleCount = 4 * 1024 * 1024;
-
-//-----------------------------------------------------------------------------
-// Enable the D3D12 debug layer.
-//-----------------------------------------------------------------------------
-void InitDebugLayer()
-{
-    {
-        ID3D12Debug1* pDebugController = nullptr;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&pDebugController))))
-        {
-            //pDebugController->SetEnableGPUBasedValidation(TRUE);
-            pDebugController->EnableDebugLayer();
-            pDebugController->Release();
-        }
-    }
-}
-
-//-----------------------------------------------------------------------------
-// share handles between render and compute
-// optionally, copy particle state from render to compute (usually compute creates particle state)
-//-----------------------------------------------------------------------------
-void Particles::ShareHandles()
-{
-    HANDLE renderFenceHandle = m_pRender->GetSharedFenceHandle();
-    auto sharedHandles = m_pCompute->GetSharedHandles(renderFenceHandle);
-    m_pRender->SetShared(sharedHandles);
-}
+#include "Particles.h"
+#include "Compute.h"
+#include "Render.h"
+#include "ArgParser.h"
 
 //-----------------------------------------------------------------------------
 // discover adapters
 // save info so roles can be dynamically changed
 //-----------------------------------------------------------------------------
 Particles::Particles(HWND in_hwnd)
-{
-    m_hwnd = in_hwnd;
-    m_vsyncEnabled = true;
-    m_fullScreen = false;
-    m_frameTime = 0;
-    m_particleSize = INITIAL_PARTICLE_SIZE;
-    m_particleIntensity = INITIAL_PARTICLE_INTENSITY;
+    : m_hwnd(in_hwnd)
 
-    m_numParticlesRendered = ParticleCount;
-    m_numParticlesCopied = ParticleCount;
-    m_numParticlesSimulated = ParticleCount;
-    m_numParticlesLinked = true;
+    , m_pRender(nullptr)
+    , m_pCompute(nullptr)
+
+    , m_renderAdapterIndex(0)
+    , m_computeAdapterIndex(0)
+
+    , m_commandQueueExtensionEnabled(false)
+    , m_vsyncEnabled(true)
+    , m_fullScreen(false)
+
+    , m_height(0)
+
+    , m_particleSize(INITIAL_PARTICLE_SIZE)
+    , m_particleIntensity(INITIAL_PARTICLE_INTENSITY)
+
+    , m_maxNumParticles(MAX_NUM_PARTICLES)
+    , m_numParticlesRendered(MAX_NUM_PARTICLES)
+    , m_numParticlesCopied(MAX_NUM_PARTICLES)
+    , m_numParticlesSimulated(MAX_NUM_PARTICLES)
+    , m_numParticlesLinked(true)
+
+    , m_enableUI(true)
+    , m_enableExtensions(true)
+{
+    ParseCommandLine();
 
     m_windowInfo.cbSize = sizeof(WINDOWINFO);
-    GetWindowInfo(m_hwnd, &m_windowInfo);
+    const BOOL rv = ::GetWindowInfo(m_hwnd, &m_windowInfo);
+    assert(rv);
 
-    InitDebugLayer();
+    // Enable the D3D12 debug layer
+    {
+        ComPtr<ID3D12Debug1> pDebugController;
+        if (SUCCEEDED(::D3D12GetDebugInterface(IID_PPV_ARGS(&pDebugController))))
+        {
+            //pDebugController->SetEnableGPUBasedValidation(TRUE);
+            pDebugController->EnableDebugLayer();
+        }
+    }
 
-    ComPtr<IDXGIFactory2> factory = nullptr;
     UINT flags = 0;
 #ifdef _DEBUG
     flags |= DXGI_CREATE_FACTORY_DEBUG;
 #endif
-    if (FAILED(CreateDXGIFactory2(flags, IID_PPV_ARGS(&factory))))
+
+    if (FAILED(::CreateDXGIFactory2(flags, IID_PPV_ARGS(&m_dxgiFactory))))
     {
         flags &= ~DXGI_CREATE_FACTORY_DEBUG;
-        ThrowIfFailed(CreateDXGIFactory2(flags, IID_PPV_ARGS(&factory)));
+        ThrowIfFailed(::CreateDXGIFactory2(flags, IID_PPV_ARGS(&m_dxgiFactory)));
     }
-    ThrowIfFailed(factory.As<IDXGIFactory4>(&m_dxgiFactory));
 
     // find adapters
-    ComPtr<IDXGIAdapter1> adapter = nullptr;
+    ComPtr<IDXGIAdapter1> adapter;
     for (UINT i = 0; m_dxgiFactory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i)
     {
-
         DXGI_ADAPTER_DESC1 desc;
-        adapter->GetDesc1(&desc);
+        ThrowIfFailed(adapter->GetDesc1(&desc));
 
         if (((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) && (desc.VendorId != 5140))
         {
             m_adapters.push_back(adapter);
 
             std::string narrowString;
-            int numChars = WideCharToMultiByte(CP_UTF8, 0, desc.Description, _countof(desc.Description), NULL, 0, NULL, NULL);
+            const int numChars = ::WideCharToMultiByte(CP_UTF8, 0, desc.Description, _countof(desc.Description), nullptr, 0, nullptr, nullptr);
             narrowString.resize(numChars);
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, (int)narrowString.size(), &narrowString[0], numChars, NULL, NULL);
+            ::WideCharToMultiByte(CP_UTF8, 0, desc.Description, (int)narrowString.size(), &narrowString[0], numChars, nullptr, nullptr);
 
             // m_adapterDescriptions holds the strings
             m_adapterDescriptions.push_back(narrowString);
             // m_adapterDescriptionPtrs is an array of pointers into m_adapterDescriptions, and is used by imgui
             m_adapterDescriptionPtrs.push_back(m_adapterDescriptions.back().c_str());
         }
-        adapter = nullptr;
     }
 
     // initial state
-    size_t numAdapters = m_adapters.size();
-    if (m_adapters.size())
+    const size_t numAdapters = m_adapters.size();
+    if (numAdapters > 0)
     {
-        m_renderAdapterIndex = 0;
-        // FIXME
-        m_computeAdapterIndex = int(numAdapters - 1);
+        AssignAdapters();
 
-        m_pRender = new Render(m_hwnd, ParticleCount, m_adapters[m_renderAdapterIndex], m_commandQueueExtensionEnabled, m_fullScreen, m_windowInfo.rcClient);
-        m_pCompute = new Compute(ParticleCount, m_adapters[m_computeAdapterIndex], m_commandQueueExtensionEnabled);
+        m_pRender = new Render(m_hwnd, m_maxNumParticles, m_adapters[m_renderAdapterIndex].Get(), m_commandQueueExtensionEnabled, m_fullScreen, m_windowInfo.rcClient);
+        m_pCompute = new Compute(m_maxNumParticles, m_adapters[m_computeAdapterIndex].Get(), m_commandQueueExtensionEnabled);
 
         ShareHandles();
 
@@ -147,25 +140,33 @@ Particles::Particles(HWND in_hwnd)
         throw;
     }
 
-    //-----------------------------
-    // one-time UI setup
-    //-----------------------------
+    if (m_enableUI)
     {
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO(); (void)io;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableSetMousePos + ImGuiBackendFlags_HasSetMousePos;  // Enable Keyboard Controls
+        //-----------------------------
+        // one-time UI setup
+        //-----------------------------
+        {
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO(); (void)io;
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableSetMousePos + ImGuiBackendFlags_HasSetMousePos;  // Enable Keyboard Controls
 
-        ImGui::StyleColorsDark();
-        ImGui_ImplWin32_Init(m_hwnd);
+            ImGui::StyleColorsDark();
+            ImGui_ImplWin32_Init(m_hwnd);
+        }
+
+        // render device specific setup
+        InitGui();
     }
 
-    // render device specific setup
-    InitGui();
+    // initial state for UI toggles
+    m_prevRenderAdapterIndex = m_renderAdapterIndex;
+    m_prevComputeAdapterIndex = m_computeAdapterIndex;
+    m_prevQueueExtension = m_commandQueueExtensionEnabled;
+    m_prevFullScreen = m_fullScreen;
 
     // start frame duration timer
     m_frameTimer.Start();
-    m_previousFrameTime = (float)m_frameTimer.GetTime();
 }
 
 //-----------------------------------------------------------------------------
@@ -174,9 +175,99 @@ Particles::~Particles()
 {
     delete m_pCompute;
     delete m_pRender;
-    ImGui::DestroyContext(nullptr);
+
+    if (m_enableUI)
+    {
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext(nullptr);
+    }
 }
 
+//-----------------------------------------------------------------------------
+// share handles between render and compute
+// optionally, copy particle state from render to compute (usually compute creates particle state)
+//-----------------------------------------------------------------------------
+void Particles::ShareHandles()
+{
+    assert(m_pRender != nullptr);
+    assert(m_pCompute != nullptr);
+
+    m_pCompute->ResetFromAsyncHelper();
+
+    const HANDLE renderFenceHandle = m_pRender->GetSharedFenceHandle();
+    assert(renderFenceHandle != nullptr);
+    m_pRender->SetShared(m_pCompute->GetSharedHandles(renderFenceHandle));
+
+    bool asyncMode = (m_renderAdapterIndex == m_computeAdapterIndex);
+    if (asyncMode)
+    {
+        m_pCompute->SetAsync(m_pRender->GetFence(), m_pRender->GetBuffers(), m_pRender->GetBufferIndex());
+    }
+    m_pRender->SetAsyncMode(asyncMode);
+}
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+void Particles::AssignAdapters()
+{
+    const size_t numAdapters = m_adapters.size();
+
+    // if no UMA (integrated) device is found, then:
+    // compute will be the first adapter enumerated (index 0)
+    // render will be the last adapter enumerated (# adapters - 1)
+    for (size_t i = 0; i < numAdapters; i++)
+    {
+        ComPtr<ID3D12Device> device;
+        ThrowIfFailed(::D3D12CreateDevice(m_adapters[i].Get(), MINIMUM_D3D_FEATURE_LEVEL, IID_PPV_ARGS(&device)));
+
+        // check for UMA support (uses system memory as local memory)
+        D3D12_FEATURE_DATA_ARCHITECTURE featureData = {};
+        const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &featureData, sizeof(featureData));
+        if (SUCCEEDED(hr) && featureData.UMA)
+        {
+            m_computeAdapterIndex = int(i);
+        }
+        else
+        {
+            m_renderAdapterIndex = int(i);
+        }
+    }
+
+    // in the case where all devices are the same type (or only 1 device):
+    if (m_computeAdapterIndex == m_renderAdapterIndex)
+    {
+        m_computeAdapterIndex = 0;
+        m_renderAdapterIndex = int(numAdapters - 1);
+    }
+}
+
+//-----------------------------------------------------------------------------
+// parse command line
+//-----------------------------------------------------------------------------
+void Particles::ParseCommandLine()
+{
+    ArgParser argParser;
+    argParser.AddArg(L"numparticles", [=](std::wstring s) {
+        m_maxNumParticles = std::stoi(s);
+        m_numParticlesRendered = m_maxNumParticles;
+        m_numParticlesCopied = m_maxNumParticles;
+        m_numParticlesSimulated = m_maxNumParticles;
+    });
+
+    argParser.AddArg(L"nogui", m_enableUI);
+    argParser.AddArg(L"noext", m_enableExtensions);
+    argParser.AddArg(L"size", m_particleSize);
+    argParser.AddArg(L"intensity", m_particleIntensity);
+    argParser.AddArg(L"novsync", m_vsyncEnabled);
+    argParser.AddArg(L"fullscreen", m_fullScreen);
+
+    argParser.AddArg(L"numCopy", [=](std::wstring s) { m_numParticlesCopied = std::stoi(s); m_numParticlesLinked = false; });
+    argParser.AddArg(L"numDraw", [=](std::wstring s) { m_numParticlesRendered = std::stoi(s); m_numParticlesLinked = false; });
+    argParser.AddArg(L"numSim", [=](std::wstring s) { m_numParticlesSimulated = std::stoi(s); m_numParticlesLinked = false; });
+
+    argParser.Parse();
+}
 
 //-----------------------------------------------------------------------------
 // Initialize UI resources
@@ -185,7 +276,12 @@ Particles::~Particles()
 //-----------------------------------------------------------------------------
 void Particles::InitGui()
 {
+    if (!m_enableUI)
+    {
+        return;
+    }
     m_srvHeap.Reset();
+
     ID3D12Device* pDevice = m_pRender->GetDevice();
 
     // Describe and create a shader resource view (SRV) heap for the texture.
@@ -198,6 +294,7 @@ void Particles::InitGui()
     CD3DX12_CPU_DESCRIPTOR_HANDLE cpu(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
     CD3DX12_GPU_DESCRIPTOR_HANDLE gpu(m_srvHeap->GetGPUDescriptorHandleForHeapStart());
 
+    ImGui_ImplDX12_Shutdown();
     ImGui_ImplDX12_Init(
         pDevice,
         Render::GetNumFrames(),
@@ -211,6 +308,11 @@ void Particles::InitGui()
 //-----------------------------------------------------------------------------
 void Particles::DrawGUI(ID3D12GraphicsCommandList* in_pCommandList)
 {
+    if (!m_enableUI)
+    {
+        return;
+    }
+
     const float m_guiWidth = 300;
     const float m_guiHeight = (float)m_height;
 
@@ -251,7 +353,7 @@ void Particles::DrawGUI(ID3D12GraphicsCommandList* in_pCommandList)
 
     if (m_renderAdapterIndex == m_computeAdapterIndex)
     {
-        ImGui::Text("PERFORMANCE ISSUE: Not Multi-adapter");
+        ImGui::Text("PERFORMANCE ISSUE: Not Multi-Adapter");
     }
     else
     {
@@ -286,9 +388,9 @@ void Particles::DrawGUI(ID3D12GraphicsCommandList* in_pCommandList)
         numParticlesSimulated = numParticlesRendered;
     }
 
-    ImGui::SliderInt("Rendered", numParticlesRendered, std::min<int>(MIN_NUM_PARTICLES, ParticleCount), ParticleCount);
-    ImGui::SliderInt("Copied", numParticlesCopied, std::min<int>(MIN_NUM_PARTICLES, ParticleCount), ParticleCount);
-    ImGui::SliderInt("Simulated", numParticlesSimulated, std::min<int>(MIN_NUM_PARTICLES, ParticleCount), ParticleCount);
+    ImGui::SliderInt("Rendered", numParticlesRendered, std::min<int>(MIN_NUM_PARTICLES, m_maxNumParticles), m_maxNumParticles);
+    ImGui::SliderInt("Copied", numParticlesCopied, std::min<int>(MIN_NUM_PARTICLES, m_maxNumParticles), m_maxNumParticles);
+    ImGui::SliderInt("Simulated", numParticlesSimulated, std::min<int>(MIN_NUM_PARTICLES, m_maxNumParticles), m_maxNumParticles);
     ImGui::Checkbox("Link Sliders", &m_numParticlesLinked);
 
     //-----------------------------------------------------
@@ -296,15 +398,15 @@ void Particles::DrawGUI(ID3D12GraphicsCommandList* in_pCommandList)
     //-----------------------------------------------------
     ImGui::Separator();
 
-    for (const auto& t : m_pRender->GetGpuTimes())
+    for (auto& t : m_pRender->GetGpuTimes())
     {
         ImGui::Text("%s: %f", t.second.c_str(), t.first * 1000.0f);
     }
-    for (const auto& t : m_pCompute->GetGpuTimes())
+    for (auto& t : m_pCompute->GetGpuTimes())
     {
         ImGui::Text("%s: %f", t.second.c_str(), t.first * 1000.0f);
     }
-    ImGui::Text("frameTime: %f", m_frameTime);
+    ImGui::Text("frameTime: %f", m_frameTimer.Get() * 1000.0f);
     //-----------------------------------------------------
 
     // resize the UI to fit the dynamically-sized components
@@ -329,13 +431,10 @@ void Particles::Shutdown()
 //-----------------------------------------------------------------------------
 void Particles::Draw()
 {
+    m_frameTimer.Update();
+
     m_pRender->SetParticleSize(m_particleSize);
     m_pRender->SetParticleIntensity(m_particleIntensity);
-
-    const int prevRenderAdapterIndex = m_renderAdapterIndex;
-    const int prevComputeAdapterIndex = m_computeAdapterIndex;
-    const bool prevQueueExtension = m_commandQueueExtensionEnabled;
-    const bool prevFullScreen = m_fullScreen;
 
     if (m_numParticlesLinked)
     {
@@ -345,85 +444,75 @@ void Particles::Draw()
 
     // start simulation. This also starts copy of results for next frame
     UINT64 renderSharedFenceValue = m_pCompute->GetFenceValue();
-    HANDLE drawHandle = m_pRender->Draw(m_numParticlesRendered, this, renderSharedFenceValue, m_numParticlesCopied);
+    const HANDLE drawHandle = m_pRender->Draw(m_numParticlesRendered, this, renderSharedFenceValue, m_numParticlesCopied);
     m_pCompute->Simulate(m_numParticlesSimulated, renderSharedFenceValue);
 
     // because the command lists of each adapter wait() on each other,
     // only need to host-wait() around the Present() on the render adapter
     if (drawHandle)
     {
-        WaitForSingleObjectEx(drawHandle, INFINITE, FALSE);
+        const DWORD rv = ::WaitForSingleObjectEx(drawHandle, INFINITE, FALSE);
+        assert(rv == WAIT_OBJECT_0);
     }
+
+    bool changeFullScreen = (m_prevFullScreen != m_fullScreen);
+    bool changeQueueExtension = (m_prevQueueExtension != m_commandQueueExtensionEnabled);
+    bool changeComputeDevice = (m_prevComputeAdapterIndex != m_computeAdapterIndex);
+    bool changeRenderDevice = (m_prevRenderAdapterIndex != m_renderAdapterIndex)
+        || (changeQueueExtension && m_pRender->GetSupportsIntelCommandQueueExtension())
+        || changeFullScreen;
 
     // if anything changed that might result in an adapter being removed,
     // drain all the pipelines
-    if (
-        (prevRenderAdapterIndex != m_renderAdapterIndex)
-        || (prevComputeAdapterIndex != m_computeAdapterIndex)
-        || (prevQueueExtension != m_commandQueueExtensionEnabled)
-        || (prevFullScreen != m_fullScreen)
-        )
+    if (changeComputeDevice || changeRenderDevice)
     {
         m_pRender->WaitForGpu();
         m_pCompute->WaitForGpu();
     }
-
-    // host-side frame time
-    float currentFrameTime = (float)m_frameTimer.GetTime();
-    float frameTime = 1000.0f * (currentFrameTime - m_previousFrameTime);
-    m_previousFrameTime = currentFrameTime;
-    const std::uint32_t AVERAGE_OVER = 20;
-    m_frameTime *= (AVERAGE_OVER - 1);
-    m_frameTime += frameTime;
-    m_frameTime /= AVERAGE_OVER;
 
     //-----------------------------------------------------
     // Handle GUI changes
     //-----------------------------------------------------
 
     // switching from windowed to full screen? remember window state
-    if (m_fullScreen && !prevFullScreen)
+    if (changeFullScreen && m_fullScreen)
     {
-        GetWindowInfo(m_hwnd, &m_windowInfo);
+        assert(m_windowInfo.cbSize == sizeof(WINDOWINFO));
+        const BOOL rv = ::GetWindowInfo(m_hwnd, &m_windowInfo);
+        assert(rv);
     }
 
     // new render device?
     // this became more complicated because changing the render queue (by enabling extension) requires reset of swapchain
     // added some extra logic to check if the render doesn't support the extension, because reset of full-screen is annoying
-    if (
-        // new adapter? need to create new Render
-        (prevRenderAdapterIndex != m_renderAdapterIndex) ||
-        // change to/from full screen? need to create new Render
-        (prevFullScreen != m_fullScreen) ||
-        // change of queue extension state on renderer that supports it? need to create new Render
-        ((prevQueueExtension != m_commandQueueExtensionEnabled) && (m_pRender->GetSupportsIntelCommandQueueExtension()))
-        )
+    if (changeRenderDevice)
     {
         delete m_pRender;
 
         // for windowed mode, reset the window style and position before creating new Render
-        if (prevFullScreen && !m_fullScreen)
+        if (changeFullScreen && !m_fullScreen)
         {
-            UINT width = m_windowInfo.rcWindow.right - m_windowInfo.rcWindow.left;
-            UINT height = m_windowInfo.rcWindow.bottom - m_windowInfo.rcWindow.top;
-            UINT left = m_windowInfo.rcWindow.left;
-            UINT top = m_windowInfo.rcWindow.top;
-            SetWindowLongPtr(m_hwnd, GWL_STYLE, m_windowInfo.dwStyle);
-            SetWindowPos(m_hwnd, HWND_NOTOPMOST, left, top, width, height, SWP_FRAMECHANGED);
+            const UINT width = m_windowInfo.rcWindow.right - m_windowInfo.rcWindow.left;
+            const UINT height = m_windowInfo.rcWindow.bottom - m_windowInfo.rcWindow.top;
+            const UINT left = m_windowInfo.rcWindow.left;
+            const UINT top = m_windowInfo.rcWindow.top;
+
+            ::SetWindowLongPtr(m_hwnd, GWL_STYLE, m_windowInfo.dwStyle);
+            ::SetWindowPos(m_hwnd, HWND_NOTOPMOST, left, top, width, height, SWP_FRAMECHANGED);
         }
 
-        m_pRender = new Render(m_hwnd, ParticleCount, m_adapters[m_renderAdapterIndex], m_commandQueueExtensionEnabled, m_fullScreen, m_windowInfo.rcClient);
-#if IMGUI_ENABLED
+        m_pRender = new Render(m_hwnd, m_maxNumParticles, m_adapters[m_renderAdapterIndex].Get(), m_commandQueueExtensionEnabled, m_fullScreen, m_windowInfo.rcClient);
+
         InitGui();
-#endif
 
         ShareHandles();
     }
 
-    if (prevComputeAdapterIndex != m_computeAdapterIndex)
+    // new compute device?
+    if (changeComputeDevice)
     {
         Compute* pOldCompute = m_pCompute;
-        m_pCompute = new Compute(ParticleCount, m_adapters[m_computeAdapterIndex],
+        m_pCompute = new Compute(m_maxNumParticles, m_adapters[m_computeAdapterIndex].Get(),
             m_commandQueueExtensionEnabled, pOldCompute);
         delete pOldCompute;
 
@@ -432,10 +521,18 @@ void Particles::Draw()
         m_commandQueueExtensionEnabled = m_pCompute->GetUsingIntelCommandQueueExtension();
     }
 
-    if (prevQueueExtension != m_commandQueueExtensionEnabled)
+    // note: we can release() and create a new compute queue with/without extensions with no issues
+    // render queue, we can't because of the tight relationship with the swap chain.
+    if (changeQueueExtension)
     {
         m_pCompute->SetUseIntelCommandQueueExtension(m_commandQueueExtensionEnabled);
         m_commandQueueExtensionEnabled = m_pCompute->GetUsingIntelCommandQueueExtension() ||
             m_pRender->GetUsingIntelCommandQueueExtension();
     }
+
+    // reset UI toggle history
+    m_prevRenderAdapterIndex = m_renderAdapterIndex;
+    m_prevComputeAdapterIndex = m_computeAdapterIndex;
+    m_prevQueueExtension = m_commandQueueExtensionEnabled;
+    m_prevFullScreen = m_fullScreen;
 }

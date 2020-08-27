@@ -25,13 +25,14 @@
 //*********************************************************
 #pragma once
 
-#include <wrl.h>
+#include "WindowProc.h"
+#include "defines.h"
+
 #include <dxgi1_6.h>
 #include <d3d12.h>
-#include <DirectXMath.h>
+#include <wrl.h>
+#include <sstream>
 
-#include "defines.h"
-#include "DXSampleHelper.h"
 #include "D3D12GpuTimer.h"
 
 using Microsoft::WRL::ComPtr;
@@ -40,28 +41,33 @@ class AdapterShared
 {
 public:
     AdapterShared();
-    ~AdapterShared();
+    virtual ~AdapterShared();
 
-    // return GPU timers
-    auto& GetGpuTimes() { return m_pTimer->GetTimes(); }
+    AdapterShared(const AdapterShared&) = delete;
+    AdapterShared(AdapterShared&&) = delete;
+    AdapterShared& operator=(const AdapterShared&) = delete;
+    AdapterShared& operator=(AdapterShared&&) = delete;
+
+    const auto& GetGpuTimes() const { return m_pTimer->GetTimes(); }
 
     // return if this adapter is using the intel command queue throttle extension
     bool GetUsingIntelCommandQueueExtension() const { return m_usingIntelCommandQueueExtension; }
-
-    // changes extension setting only if different from current setting
-    virtual void SetUseIntelCommandQueueExtension(bool in_desiredSetting) = 0;
 
     // stalls until adapter is idle
     virtual void WaitForGpu() = 0;
 
     // returns if this adapter uses unified memory (system memory is treated as local adapter memory)
-    bool GetIsUMA() { return m_isUMA; }
-protected:
-    D3D12GpuTimer* m_pTimer;
+    bool GetIsUMA() const { return m_isUMA; }
 
+protected:
     // create a device with the highest feature support
-    void CreateDevice(IDXGIAdapter1* in_pAdapter, Microsoft::WRL::ComPtr<ID3D12Device>& in_device);
+    void CreateDevice(IDXGIAdapter1* in_pAdapter, ComPtr<ID3D12Device>& in_device);
+
+    std::wstring GetAssetFullPath(const wchar_t* const in_filename);
+
+    D3D12GpuTimer* m_pTimer;
     bool m_usingIntelCommandQueueExtension;
+
 private:
     bool m_isUMA;
 };
@@ -69,8 +75,10 @@ private:
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 inline AdapterShared::AdapterShared()
+    : m_pTimer(nullptr)
+    , m_usingIntelCommandQueueExtension(false)
+    , m_isUMA(false)
 {
-    m_pTimer = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -82,19 +90,25 @@ inline AdapterShared::~AdapterShared()
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
-inline bool GetIsUMA(ID3D12Device* in_pDevice)
+inline void AdapterShared::CreateDevice(IDXGIAdapter1* in_pAdapter, ComPtr<ID3D12Device>& out_device)
 {
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-inline void AdapterShared::CreateDevice(IDXGIAdapter1* in_pAdapter, Microsoft::WRL::ComPtr<ID3D12Device>& out_device)
-{
-    ThrowIfFailed(D3D12CreateDevice(in_pAdapter, MINIMUM_D3D_FEATURE_LEVEL, IID_PPV_ARGS(&out_device)));
+    ThrowIfFailed(::D3D12CreateDevice(in_pAdapter, MINIMUM_D3D_FEATURE_LEVEL, IID_PPV_ARGS(&out_device)));
 
     // check for UMA support (uses system memory as local memory)
     D3D12_FEATURE_DATA_ARCHITECTURE featureData = {};
-    out_device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &featureData, sizeof(featureData));
-    m_isUMA = featureData.UMA;
+    const HRESULT hr = out_device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &featureData, sizeof(featureData));
+    m_isUMA = SUCCEEDED(hr) && featureData.UMA;
 }
 
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+inline std::wstring AdapterShared::GetAssetFullPath(const wchar_t* const in_filename)
+{
+    constexpr size_t PATHBUFFERSIZE = MAX_PATH * 4;
+    TCHAR buffer[PATHBUFFERSIZE];
+    ::GetCurrentDirectory(_countof(buffer), buffer);
+
+    std::wostringstream assetFullPath;
+    assetFullPath << buffer << L"\\\\" << in_filename;
+    return assetFullPath.str();
+}
