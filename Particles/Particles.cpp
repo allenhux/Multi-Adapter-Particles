@@ -353,13 +353,13 @@ void Particles::DrawGUI(ID3D12GraphicsCommandList* in_pCommandList)
 
     if (m_renderAdapterIndex == m_computeAdapterIndex)
     {
-        ImGui::Text("PERFORMANCE ISSUE: Not Multi-Adapter");
+        ImGui::Text("Single Adapter with Async Compute");
     }
     else
     {
         if (m_pCompute->GetIsUMA())
         {
-            ImGui::Text("Good: Compute is UMA");
+            ImGui::Text("Good: Multi-GPU with UMA Compute");
         }
         else
         {

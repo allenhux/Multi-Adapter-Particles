@@ -410,9 +410,6 @@ void Compute::CopyState(Compute* in_pCompute)
 }
 
 //-----------------------------------------------------------------------------
-// called to dynamically change the compute adapter
-
-//-----------------------------------------------------------------------------
 // create root sig, pipeline state, descriptor heap, srv uav cbv
 //-----------------------------------------------------------------------------
 void Compute::Initialize(IDXGIAdapter1* in_pAdapter)
